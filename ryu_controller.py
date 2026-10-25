@@ -54,6 +54,7 @@ Dependencias:
 =============================================================================
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -73,6 +74,9 @@ from ryu.controller.handler import (
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, tcp, udp, vlan
 from ryu.lib import hub
+from ryu.app.wsgi import ControllerBase, WSGIApplication, route, Response
+
+API_INSTANCE = 'ryu_ia_app'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN — todos los parámetros ajustables están aquí
@@ -152,6 +156,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
     Controlador SDN con detección de movimiento lateral en 3 capas.
     """
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'wsgi': WSGIApplication}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -221,6 +226,8 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         logger.info('=' * 60)
         if AGENT_ENABLED and not AGENT_TOKEN:
             logger.error('[AGENTE] AGENT_TOKEN vacío: el agente rechazará las alertas (401)')
+
+        kwargs['wsgi'].register(RyuIAApi, {API_INSTANCE: self})
 
     # ═══════════════════════════════════════════════════════════════════════════
     # CAPA BASE — CONEXIÓN DE SWITCHES
@@ -825,3 +832,104 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         if src_ip.startswith(SUBNET_ADM):
             return f'VLAN ADM (ID={VLAN_ADM}), subred {SUBNET_ADM}0/24'
         return 'subred desconocida'
+
+    def desbloquear_host(self, ip):
+        info = self.blocked_hosts.pop(ip, None)
+        if info is None:
+            return None
+        borradas = 0
+        for dpid in info['dpids']:
+            dp = self.datapaths.get(dpid)
+            if not dp:
+                continue
+            parser, ofp = dp.ofproto_parser, dp.ofproto
+            mod = parser.OFPFlowMod(
+                datapath=dp, command=ofp.OFPFC_DELETE_STRICT, priority=100,
+                out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
+                match=parser.OFPMatch(eth_type=0x0800, ipv4_src=ip),
+            )
+            dp.send_msg(mod)
+            borradas += 1
+        # Limpiar TODO el estado del host para que no se vuelva a bloquear de inmediato
+        self.host_alert_state.pop(ip, None)
+        self.metric_snapshot.pop(ip, None)
+        self.host_flow_log.pop(ip, None)
+        logger.warning(f'[API] {ip} desbloqueado por el operador ({borradas} regla(s))')
+        return borradas
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# API REST (A5) — puerto 8080, todas las rutas exigen X-Agent-Token
+# ═══════════════════════════════════════════════════════════════════════════════
+def _json(cuerpo, status=200):
+    return Response(status=status, content_type='application/json',
+                    charset='utf-8', body=json.dumps(cuerpo).encode('utf-8'))
+
+
+class RyuIAApi(ControllerBase):
+    def __init__(self, req, link, data, **config):
+        super().__init__(req, link, data, **config)
+        self.app = data[API_INSTANCE]
+
+    def _autorizado(self, req):
+        import hmac
+        token = req.headers.get('X-Agent-Token', '')
+        # En bytes: compare_digest no acepta texto con caracteres no ASCII
+        return bool(AGENT_TOKEN) and hmac.compare_digest(
+            token.encode('utf-8'), AGENT_TOKEN.encode('utf-8'))
+
+    @route('ryu_ia', '/ryu/estado', methods=['GET'])
+    def estado(self, req, **kwargs):
+        if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
+        return _json({
+            'switches': [f'{d:#018x}' for d in self.app.datapaths],
+            'hosts_bloqueados': len(self.app.blocked_hosts),
+            'umbrales': self.app.umbrales,
+            'version': '2.0',
+            'pesos': METRIC_WEIGHTS,
+            'capacidades': [],
+        })
+
+    @route('ryu_ia', '/ryu/hosts/bloqueados', methods=['GET'])
+    def bloqueados(self, req, **kwargs):
+        if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
+        return _json([
+            {'ip': ip, 'dpid': f'{info["dpids"][0]:#018x}' if info['dpids'] else None,
+             'desde': info['desde']}
+            for ip, info in self.app.blocked_hosts.items()
+        ])
+
+    @route('ryu_ia', '/ryu/hosts/{ip}/desbloquear', methods=['POST'])
+    def desbloquear(self, req, ip, **kwargs):
+        if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
+        try:
+            ipaddress.IPv4Address(ip)
+        except ValueError:
+            return _json({'error': 'ip inválida'}, 422)
+        borradas = self.app.desbloquear_host(ip)
+        if borradas is None:
+            return _json({'error': 'host no bloqueado'}, 404)
+        return _json({'ok': True, 'ip': ip, 'reglas_borradas': borradas})
+
+    @route('ryu_ia', '/ryu/umbrales', methods=['GET'])
+    def leer_umbrales(self, req, **kwargs):
+        if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
+        return _json(self.app.umbrales)
+
+    @route('ryu_ia', '/ryu/umbrales', methods=['PUT'])
+    def cambiar_umbrales(self, req, **kwargs):
+        if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
+        try:
+            cambios = json.loads(req.body or b'{}')
+        except ValueError:
+            return _json({'error': 'json inválido'}, 422)
+        if not isinstance(cambios, dict):
+            return _json({'error': 'el cuerpo debe ser un objeto JSON'}, 422)
+        for k, v in cambios.items():
+            # bool es subclase de int en Python: se rechaza aparte
+            if (k not in self.app.umbrales or isinstance(v, bool)
+                    or not isinstance(v, int) or v <= 0):
+                return _json({'error': f'valor inválido para {k}'}, 422)
+        self.app.umbrales.update(cambios)
+        logger.warning(f'[API] Umbrales actualizados: {cambios}')
+        return _json(self.app.umbrales)
