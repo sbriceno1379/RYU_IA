@@ -245,3 +245,69 @@ Esperado: "modo": "drop_total"; en s1 ya no hay reglas de 110, solo el DROP de 1
 Esperado: desbloqueado desde cuarentena; ni reglas de 100 ni de 110 para 10.0.10.1 en s1, s2 y s3, y h1 ping -c 2 h2 responde.
 
 Parte 3 (con el agente, como en R2): el panel ofrece la cuarentena solo cuando la recomienda; al aprobarla, Ryu queda en "modo": "cuarentena" y el agente lo verifica.
+
+Hallazgo R3a: con ataque_completo.py el LLM da "indeterminado" (0.45) porque M1, M2 y M5 apenas superan el umbral y no hay M3. La escalera queda en mantener_drop. Para evaluar la escalera completa con trafico real hace falta un escenario fuerte (con transferencia SMB para M3) y uno benigno.
+
+## R3b - A7: limitar tasa
+
+Prompt:
+
+    Fase R3b - A7. Lee CLAUDE.md, docs/PLAN.md (seccion R3b) y docs/contratos.md (C2 y sus dos notas).
+
+    Que significa "limitado" (contrato C7): el host recupera la red completa, sin DROP de puertos, pero a maximo kbps. Se usa cuando el agente cree que fue falsa alarma.
+
+    Alcance, solo en ryu_controller.py:
+    - POST /ryu/hosts/{ip}/limitar_tasa con cuerpo opcional {"kbps": entero > 0}; por defecto 1000. Respuesta {"ok": true, "ip", "modo": "limitado", "kbps"}.
+    - 404 si el host no esta bloqueado, 422 si la ip o kbps son invalidos (los bool no cuentan como entero, y tampoco un cuerpo que no es objeto).
+    - Solo desde DROP total, igual que la cuarentena. Idempotente y transaccional segun la nota de C2: si falla en algun switch, se borra lo instalado, queda el DROP total y se responde 500 con {"ok": false, "modo": "drop_total"}.
+    - GET /ryu/hosts/bloqueados agrega "kbps" cuando el modo es limitado.
+    - bloqueo_total vuelve a DROP total desde limitado; desbloquear funciona desde limitado y borra todo lo del host (reglas y meter).
+    - GET /ryu/estado: "capacidades": ["cuarentena", "limitar_tasa"].
+    - El host sigue en blocked_hosts mientras este limitado (no se vuelve a evaluar).
+
+    No toques la deteccion, los pesos, los cortes 30/60, la alerta, A5 ni A6.
+
+    Paso 1: valida y propone en maximo 5 lineas: como limitaras la tasa (meter de OpenFlow 1.3 u otra forma, y por que), como se reenvia el trafico del host limitado y como pruebas la reversion sin sudo. Si necesitas saber si el OVS soporta meters, dame el comando exacto con sudo y espera mi resultado. Espera mi aprobacion.
+    Paso 2: implementa y corre la parte 1 de la prueba de aceptacion mas tu prueba de reversion en el scratchpad. No hagas git add ni commit.
+    Paso 3: responde con el formato de entrega.
+
+Prueba de aceptacion, parte 1 (solo Ryu):
+
+    curl -s localhost:8080/ryu/estado -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: "capacidades": ["cuarentena", "limitar_tasa"].
+
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/ryu/hosts/10.0.10.99/limitar_tasa -H "X-Agent-Token: $AGENT_TOKEN"
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/ryu/hosts/abc/limitar_tasa -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: 404 y 422.
+
+Prueba de aceptacion, parte 2 (preparacion comun, con h1 bloqueado):
+
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/ryu/hosts/10.0.10.1/limitar_tasa -H "X-Agent-Token: $AGENT_TOKEN" -d '{"kbps": 0}'
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/ryu/hosts/10.0.10.1/limitar_tasa -H "X-Agent-Token: $AGENT_TOKEN" -d '{"kbps": true}'
+Esperado: 422 y 422.
+
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/limitar_tasa -H "X-Agent-Token: $AGENT_TOKEN" -d '{"kbps": 1000}'
+Esperado: {"ok": true, "ip": "10.0.10.1", "modo": "limitado", "kbps": 1000}.
+
+    curl -s localhost:8080/ryu/hosts/bloqueados -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: 10.0.10.1 con "modo": "limitado" y "kbps": 1000.
+
+En mininet>:
+    h1 ping -c 2 h2
+Esperado: responde (ya no hay DROP).
+    iperf h1 h2
+Esperado: alrededor de 1 Mbits/sec o menos.
+    iperf h3 h2
+Esperado: mucho mas alto (h3 no esta limitado).
+
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/limitar_tasa -H "X-Agent-Token: $AGENT_TOKEN" -d '{"kbps": 1000}'
+Esperado: ok otra vez, sin reglas ni meters duplicados.
+
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/bloqueo_total -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: "modo": "drop_total"; h1 ping -c 2 h2 vuelve a dar 100% de perdida.
+
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/limitar_tasa -H "X-Agent-Token: $AGENT_TOKEN"
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/desbloquear -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: desbloqueado desde limitado; iperf h1 h2 vuelve a la velocidad normal y no queda nada de 10.0.10.1 en s1, s2 y s3.
+
+Parte 3 (con el agente): en el panel, "Acciones" de 10.0.10.1 ofrece "Limitar tasa"; al aplicarla, la fila muestra "Tasa limitada (1000 kbps)".
