@@ -1,5 +1,27 @@
 {
   "permissions": {
-    "deny": ["Edit(docs/ajustes.md)", "Write(docs/ajustes.md)", "Edit(docs/contratos.md)", "Write(docs/contratos.md)"]
+    "allow": [
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)"
+    ],
+    "ask": [
+      "Bash(git commit:*)",
+      "Bash(git add:*)",
+      "Bash(pip install:*)",
+      "Bash(.venv/bin/pip install:*)",
+      "Edit(requirements-ryu.txt)",
+      "Edit(.gitignore)"
+    ],
+    "deny": [
+      "Edit(CLAUDE.md)",
+      "Edit(docs/ajustes.md)",
+      "Edit(docs/contratos.md)",
+      "Bash(git push:*)",
+      "Bash(git reset:*)",
+      "Bash(git rebase:*)",
+      "Bash(sudo:*)",
+      "Bash(rm -rf:*)"
+    ]
   }
 }

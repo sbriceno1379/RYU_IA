@@ -55,6 +55,7 @@ Dependencias:
 """
 
 import json
+import os
 import re
 import time
 import threading
@@ -127,9 +128,10 @@ SCORE_CRITICAL   = 60
 STARTUP_GRACE_SEC = 30
 
 # ── Destino del payload JSON (agente LLM) ─────────────────────────────────────
-AGENT_URL     = 'http://localhost:8081/alert'
-AGENT_TIMEOUT = 35
+AGENT_URL     = 'http://localhost:8081/api/alertas'
+AGENT_TIMEOUT = 5       # el agente responde en < 300 ms; el análisis ocurre después
 AGENT_ENABLED = True    # True cuando el agente LLM esté corriendo
+AGENT_TOKEN   = os.environ.get('AGENT_TOKEN', '')
 
 # ── Rate-limit: parámetros de la Capa 2 ──────────────────────────────────────
 RATE_LIMIT_IDLE_TIMEOUT = 60
@@ -186,7 +188,19 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         self.metric_snapshot = defaultdict(dict)
 
         # Hosts con DROP instalado
-        self.blocked_hosts = set()
+        self.blocked_hosts = {}   # {ip: {'dpids': [int, ...], 'desde': 'ISO-8601Z'}}
+
+        # Umbrales editables en tiempo de ejecución (mismos valores por defecto)
+        self.umbrales = {
+            'M1': THRESHOLD_M1_FLOWS_PER_30S,            # 20
+            'M2': THRESHOLD_M2_UNIQUE_DSTS,              # 8
+            'M3_DURACION_S': THRESHOLD_M3_DURATION_SEC,  # 5
+            'M3_BYTES': THRESHOLD_M3_BYTES,              # 512000
+            'M4': THRESHOLD_M4_PACKET_IN_MIN,            # 200
+            'M5': THRESHOLD_M5_COUNT,                    # 5
+            'SCORE_SOSPECHOSO': SCORE_SUSPICIOUS,        # 30
+            'SCORE_CRITICO': SCORE_CRITICAL,             # 60
+        }
 
         # Tiempo de arranque
         self._start_time = time.time()
@@ -197,14 +211,16 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         logger.info('=' * 60)
         logger.info('  Controlador SDN — 3 capas de detección activas  v2')
         logger.info(f'  Período de gracia: {STARTUP_GRACE_SEC}s')
-        logger.info(f'  Puntaje SOSPECHOSO: >={SCORE_SUSPICIOUS} puntos (rate-limit)')
-        logger.info(f'  Puntaje CRITICO:    >={SCORE_CRITICAL} puntos (DROP + LLM)')
+        logger.info(f'  Puntaje SOSPECHOSO: >={self.umbrales["SCORE_SOSPECHOSO"]} puntos (rate-limit)')
+        logger.info(f'  Puntaje CRITICO:    >={self.umbrales["SCORE_CRITICO"]} puntos (DROP + LLM)')
         logger.info(f'  Pesos: M5={METRIC_WEIGHTS["M5"]} M3={METRIC_WEIGHTS["M3"]} '
                     f'M1={METRIC_WEIGHTS["M1"]} M2={METRIC_WEIGHTS["M2"]} M4={METRIC_WEIGHTS["M4"]}')
         logger.info(f'  M1/M2: Packet-In en tiempo real (ventana {WINDOW_M1_M2_SEC}s)')
         logger.info(f'  M4 cooldown: {M4_ALERT_COOLDOWN_SEC}s entre alertas')
         logger.info(f'  Agente LLM: {"HABILITADO" if AGENT_ENABLED else "DESHABILITADO (modo log)"}')
         logger.info('=' * 60)
+        if AGENT_ENABLED and not AGENT_TOKEN:
+            logger.error('[AGENTE] AGENT_TOKEN vacío: el agente rechazará las alertas (401)')
 
     # ═══════════════════════════════════════════════════════════════════════════
     # CAPA BASE — CONEXIÓN DE SWITCHES
@@ -299,13 +315,13 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                 ew_count = len(ew_log)
 
                 logger.debug(f'[M5] {src_ip}->{dst_ip}:{tp_dst} '
-                             f'W2W acumulados: {ew_count}/{THRESHOLD_M5_COUNT}')
+                             f'W2W acumulados: {ew_count}/{self.umbrales["M5"]}')
 
-                if ew_count >= THRESHOLD_M5_COUNT:
+                if ew_count >= self.umbrales['M5']:
                     self._trigger_metric(
                         src_ip, 'M5', datapath, in_port,
                         msg=f'M5: {ew_count} flujos W2W en puertos criticos '
-                            f'>= umbral {THRESHOLD_M5_COUNT}'
+                            f'>= umbral {self.umbrales["M5"]}'
                     )
 
         # ── Aislamiento inter-VLAN ────────────────────────────────────────────
@@ -364,23 +380,23 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         now   = time.time()
         state = self.host_alert_state[src_ip]
 
-        if m1_val > THRESHOLD_M1_FLOWS_PER_30S:
+        if m1_val > self.umbrales['M1']:
             last_m1 = state.get('last_m1_alert', 0)
             if now - last_m1 >= M1_ALERT_COOLDOWN_SEC:
                 state['last_m1_alert'] = now
                 self._trigger_metric(
                     src_ip, 'M1', datapath, None,
                     msg=f'M1: {m1_val} flujos nuevos en {WINDOW_M1_M2_SEC}s '
-                        f'> umbral {THRESHOLD_M1_FLOWS_PER_30S}'
+                        f'> umbral {self.umbrales["M1"]}'
                 )
-        if m2_val > THRESHOLD_M2_UNIQUE_DSTS:
+        if m2_val > self.umbrales['M2']:
             last_m2 = state.get('last_m2_alert', 0)
             if now - last_m2 >= M2_ALERT_COOLDOWN_SEC:
                 state['last_m2_alert'] = now
                 self._trigger_metric(
                     src_ip, 'M2', datapath, None,
                     msg=f'M2: {m2_val} destinos unicos en {WINDOW_M1_M2_SEC}s '
-                        f'> umbral {THRESHOLD_M2_UNIQUE_DSTS}'
+                        f'> umbral {self.umbrales["M2"]}'
                 )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -395,7 +411,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         log['packet_in_times'] = [t for t in log['packet_in_times'] if t > cutoff]
         rate = len(log['packet_in_times']) * (60 / WINDOW_M4_SEC)
 
-        if rate > THRESHOLD_M4_PACKET_IN_MIN:
+        if rate > self.umbrales['M4']:
             state = self.host_alert_state[src_ip]
             last  = state.get('last_alert', 0)
 
@@ -404,7 +420,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                 self._trigger_metric(
                     src_ip, 'M4', datapath, None,
                     msg=f'M4: {rate:.0f} Packet-In/min '
-                        f'> umbral {THRESHOLD_M4_PACKET_IN_MIN}'
+                        f'> umbral {self.umbrales["M4"]}'
                 )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -459,8 +475,8 @@ class SDNRansomwareDetector(app_manager.RyuApp):
             m3_flow = next((
                 f for f in flows
                 if f['tp_dst'] == 445
-                and f['duration'] < THRESHOLD_M3_DURATION_SEC
-                and f['bytes']    > THRESHOLD_M3_BYTES
+                and f['duration'] < self.umbrales['M3_DURACION_S']
+                and f['bytes']    > self.umbrales['M3_BYTES']
             ), None)
 
             if m3_flow:
@@ -468,8 +484,8 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                 self.metric_snapshot[src_ip]['M3_bytes']    = m3_flow['bytes']
                 self._trigger_metric(
                     src_ip, 'M3', datapath, None,
-                    msg=f'M3: flujo SMB <{THRESHOLD_M3_DURATION_SEC}s '
-                        f'y >{THRESHOLD_M3_BYTES}B detectado '
+                    msg=f'M3: flujo SMB <{self.umbrales["M3_DURACION_S"]}s '
+                        f'y >{self.umbrales["M3_BYTES"]}B detectado '
                         f'({m3_flow["bytes"]}B en {m3_flow["duration"]}s)'
                 )
 
@@ -512,8 +528,9 @@ class SDNRansomwareDetector(app_manager.RyuApp):
 
         score = state['score']
 
-        # Guardar valor numérico para el JSON
-        nums = re.findall(r'\d+\.?\d*', msg)
+        # Guardar valor numérico para el JSON (el texto después de "Mx:")
+        cuerpo = msg.split(':', 1)[1] if ':' in msg else msg
+        nums = re.findall(r'\d+\.?\d*', cuerpo)
         if nums:
             self.metric_snapshot[src_ip][metric_id] = float(nums[0])
 
@@ -526,7 +543,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         prev_level = state['level']
 
         # ── CAPA 2: SOSPECHOSO ────────────────────────────────────────────────
-        if SCORE_SUSPICIOUS <= score < SCORE_CRITICAL:
+        if self.umbrales['SCORE_SOSPECHOSO'] <= score < self.umbrales['SCORE_CRITICO']:
             if prev_level == 'NORMAL':
                 state['level'] = 'SOSPECHOSO'
                 logger.warning(
@@ -540,7 +557,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                     self._apply_rate_limit(dp, src_ip)
 
         # ── CAPA 3: CRITICO ───────────────────────────────────────────────────
-        elif score >= SCORE_CRITICAL:
+        elif score >= self.umbrales['SCORE_CRITICO']:
             state['level'] = 'CRITICO'
             if src_ip not in self.blocked_hosts:
                 logger.critical(
@@ -590,17 +607,19 @@ class SDNRansomwareDetector(app_manager.RyuApp):
     # CAPA 3 — DROP + JSON AL AGENTE LLM
     # ═══════════════════════════════════════════════════════════════════════════
     def _block_host(self, datapath, src_ip):
-        parser = datapath.ofproto_parser
-        match  = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
-        self._add_flow(
-            datapath, priority=100, match=match,
-            actions=[],
-            idle_timeout=0,
-            hard_timeout=0,
-        )
-        self.blocked_hosts.add(src_ip)
-        logger.critical(f'[CAPA 3] {src_ip} — OFPFlowMod DROP instalado '
-                        f'(prioridad 100, permanente)')
+        """DROP prioridad 100 en TODOS los switches conectados."""
+        dpids = []
+        for dpid, dp in list(self.datapaths.items()):
+            parser = dp.ofproto_parser
+            match  = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
+            self._add_flow(dp, priority=100, match=match, actions=[],
+                           idle_timeout=0, hard_timeout=0)
+            dpids.append(dpid)
+        self.blocked_hosts[src_ip] = {
+            'dpids': dpids,
+            'desde': datetime.utcnow().isoformat() + 'Z',
+        }
+        logger.critical(f'[CAPA 3] {src_ip} — DROP en {len(dpids)} switch(es)')
 
     def _send_json_alert(self, src_ip, state, datapath):
         snap      = self.metric_snapshot.get(src_ip, {})
@@ -673,7 +692,8 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         req  = urllib.request.Request(
             AGENT_URL,
             data=data,
-            headers={'Content-Type': 'application/json'},
+            headers={'Content-Type': 'application/json',
+                     'X-Agent-Token': AGENT_TOKEN},
             method='POST',
         )
         try:
@@ -710,15 +730,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         if forenses:
             logger.info(f'[AGENTE] Forenses:   {forenses}')
 
-        if veredicto == 'falso_positivo' and confianza >= 85:
-            logger.info(f'[AGENTE] Falso positivo ({confianza}%) '
-                        f'— limpiando estado de {src_ip}')
-            self.blocked_hosts.discard(src_ip)
-            self.host_alert_state[src_ip]['level']             = 'NORMAL'
-            self.host_alert_state[src_ip]['metrics_triggered'] = set()
-            self.host_alert_state[src_ip]['score']             = 0
-            self.metric_snapshot.pop(src_ip, None)
-        elif veredicto in ('confirmado', 'ya_contenido'):
+        if veredicto in ('confirmado', 'ya_contenido'):
             logger.info(f'[AGENTE] Ataque {veredicto} — DROP mantenido para {src_ip}')
         elif veredicto == 'indeterminado':
             logger.warning(f'[AGENTE] Indeterminado para {src_ip} '
@@ -804,7 +816,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         if 'M5' in t:                iocs.append('IOC-04')
         if {'M5', 'M1'}.issubset(t): iocs.append('IOC-07')
         score = sum(METRIC_WEIGHTS.get(m, 0) for m in t)
-        if score >= SCORE_CRITICAL:  iocs.append('IOC-05')
+        if score >= self.umbrales['SCORE_CRITICO']:  iocs.append('IOC-05')
         return sorted(set(iocs))
 
     def _get_topology_context(self, src_ip):

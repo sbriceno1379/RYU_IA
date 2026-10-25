@@ -52,3 +52,4 @@ Si algo de estos documentos no coincide con el codigo, detente y avisa. No lo re
 6. No uses sudo. Si algo lo necesita, dame el comando exacto y yo lo ejecuto.
 7. No modifiques nada de ~/Desktop/sdn-agent-v2. Puedes leerlo si hace falta.
 8. Al terminar una fase: muestra lo que se probo y su resultado y un resumen de maximo 8 lineas (que cambio, que quedo pendiente). Una fase es un commit.
+9. Nunca hagas git add ni git commit sin que yo lo apruebe en ese momento. Al terminar una fase, muestrame el diff y propon el mensaje del commit; yo decido.
