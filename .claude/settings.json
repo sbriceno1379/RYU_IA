@@ -1,0 +1,5 @@
+{
+  "permissions": {
+    "deny": ["Edit(docs/ajustes.md)", "Write(docs/ajustes.md)", "Edit(docs/contratos.md)", "Write(docs/contratos.md)"]
+  }
+}
