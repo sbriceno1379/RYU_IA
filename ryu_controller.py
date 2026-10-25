@@ -141,6 +141,10 @@ AGENT_TOKEN   = os.environ.get('AGENT_TOKEN', '')
 RATE_LIMIT_IDLE_TIMEOUT = 60
 RATE_LIMIT_HARD_TIMEOUT = 120
 
+# ── Cuarentena (A6) ───────────────────────────────────────────────────────────
+QUARANTINE_DROP_PORTS = (22, 135, 139, 445, 3389, 5985)  # TCP, DROP prioridad 110
+QUARANTINE_ALLOW      = ((17, 53), (6, 53), (17, 67))    # DNS UDP/TCP y DHCP, prioridad 101
+
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -625,6 +629,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         self.blocked_hosts[src_ip] = {
             'dpids': dpids,
             'desde': datetime.utcnow().isoformat() + 'Z',
+            'modo': 'drop_total',
         }
         logger.critical(f'[CAPA 3] {src_ip} — DROP en {len(dpids)} switch(es)')
 
@@ -812,7 +817,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
             hard_timeout=hard_timeout,
             table_id=table_id,
         )
-        datapath.send_msg(mod)
+        return datapath.send_msg(mod)
 
     def _map_ioc(self, triggered):
         t = set(triggered)
@@ -850,12 +855,92 @@ class SDNRansomwareDetector(app_manager.RyuApp):
             )
             dp.send_msg(mod)
             borradas += 1
+            if info.get('modo') == 'cuarentena':
+                for prio, match, _ in self._reglas_cuarentena(dp, ip):
+                    self._borrar_regla(dp, prio, match)
+                    borradas += 1
         # Limpiar TODO el estado del host para que no se vuelva a bloquear de inmediato
         self.host_alert_state.pop(ip, None)
         self.metric_snapshot.pop(ip, None)
         self.host_flow_log.pop(ip, None)
         logger.warning(f'[API] {ip} desbloqueado por el operador ({borradas} regla(s))')
         return borradas
+
+    def _reglas_cuarentena(self, dp, ip):
+        """(prioridad, match, actions) de las reglas propias de la cuarentena.
+        El DROP de prioridad 100 (solo IPv4, así que ARP pasa) es el mismo del bloqueo total."""
+        parser, ofp = dp.ofproto_parser, dp.ofproto
+        reglas = []
+        for port in QUARANTINE_DROP_PORTS:
+            match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip,
+                                    ip_proto=6, tcp_dst=port)
+            reglas.append((110, match, []))
+        for proto, port in QUARANTINE_ALLOW:
+            campo = {'tcp_dst': port} if proto == 6 else {'udp_dst': port}
+            match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip,
+                                    ip_proto=proto, **campo)
+            actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER,
+                                              ofp.OFPCML_NO_BUFFER)]
+            reglas.append((101, match, actions))
+        return reglas
+
+    def _borrar_regla(self, dp, priority, match):
+        ofp = dp.ofproto
+        mod = dp.ofproto_parser.OFPFlowMod(
+            datapath=dp, command=ofp.OFPFC_DELETE_STRICT, priority=priority,
+            out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY, match=match,
+        )
+        return dp.send_msg(mod)
+
+    def cambiar_modo(self, ip, modo):
+        """
+        Pasa un host bloqueado a 'cuarentena' o a 'drop_total' (A6, nota C2).
+        El modo nuevo se instala antes de quitar el anterior y el DROP de
+        prioridad 100 no se quita nunca. Devuelve None si el host no está
+        bloqueado, True si quedó en el modo pedido y False si falló en algún
+        switch (en ese caso queda en drop_total).
+        """
+        info = self.blocked_hosts.get(ip)
+        if info is None:
+            return None
+        dps = [self.datapaths.get(dpid) for dpid in info['dpids']]
+        ok = True
+
+        if modo == 'cuarentena':
+            alcanzados = []
+            for dp in dps:
+                if dp is None:
+                    ok = False
+                    break
+                alcanzados.append(dp)
+                if not all([self._add_flow(dp, prio, match, actions)
+                            for prio, match, actions in self._reglas_cuarentena(dp, ip)]):
+                    ok = False
+                    break
+            if ok:
+                info['modo'] = 'cuarentena'
+                logger.warning(f'[API] {ip} -> cuarentena en {len(dps)} switch(es)')
+                return True
+            # Reversión: borrar lo instalado; el DROP de 100 sigue puesto
+            for dp in alcanzados:
+                for prio, match, _ in self._reglas_cuarentena(dp, ip):
+                    self._borrar_regla(dp, prio, match)
+        else:
+            for dp in dps:
+                if dp is None:
+                    ok = False
+                    continue
+                match = dp.ofproto_parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
+                ok = self._add_flow(dp, 100, match, []) and ok
+                for prio, match, _ in self._reglas_cuarentena(dp, ip):
+                    ok = self._borrar_regla(dp, prio, match) and ok
+
+        info['modo'] = 'drop_total'
+        if ok:
+            logger.warning(f'[API] {ip} -> drop_total en {len(dps)} switch(es)')
+        else:
+            logger.error(f'[API] {ip} — fallo al pasar a {modo}: queda en drop_total')
+        return ok
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -887,7 +972,7 @@ class RyuIAApi(ControllerBase):
             'umbrales': self.app.umbrales,
             'version': '2.0',
             'pesos': METRIC_WEIGHTS,
-            'capacidades': [],
+            'capacidades': ['cuarentena'],
         })
 
     @route('ryu_ia', '/ryu/hosts/bloqueados', methods=['GET'])
@@ -895,7 +980,7 @@ class RyuIAApi(ControllerBase):
         if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
         return _json([
             {'ip': ip, 'dpid': f'{info["dpids"][0]:#018x}' if info['dpids'] else None,
-             'desde': info['desde']}
+             'desde': info['desde'], 'modo': info.get('modo', 'drop_total')}
             for ip, info in self.app.blocked_hosts.items()
         ])
 
@@ -910,6 +995,27 @@ class RyuIAApi(ControllerBase):
         if borradas is None:
             return _json({'error': 'host no bloqueado'}, 404)
         return _json({'ok': True, 'ip': ip, 'reglas_borradas': borradas})
+
+    @route('ryu_ia', '/ryu/hosts/{ip}/cuarentena', methods=['POST'])
+    def cuarentena(self, req, ip, **kwargs):
+        return self._cambiar_modo(req, ip, 'cuarentena')
+
+    @route('ryu_ia', '/ryu/hosts/{ip}/bloqueo_total', methods=['POST'])
+    def bloqueo_total(self, req, ip, **kwargs):
+        return self._cambiar_modo(req, ip, 'drop_total')
+
+    def _cambiar_modo(self, req, ip, modo):
+        if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
+        try:
+            ipaddress.IPv4Address(ip)
+        except ValueError:
+            return _json({'error': 'ip inválida'}, 422)
+        ok = self.app.cambiar_modo(ip, modo)
+        if ok is None:
+            return _json({'error': 'host no bloqueado'}, 404)
+        if not ok:
+            return _json({'ok': False, 'modo': 'drop_total'}, 500)
+        return _json({'ok': True, 'ip': ip, 'modo': modo})
 
     @route('ryu_ia', '/ryu/umbrales', methods=['GET'])
     def leer_umbrales(self, req, **kwargs):
