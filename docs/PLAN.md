@@ -186,3 +186,62 @@ Prompt: se escribe al llegar.
 ## R3a, R3b, R3c y R4
 
 Prompts: se escriben al llegar. Cada uno empieza con una fase de validación sin cambios (por ejemplo, en R3b confirmar si el OVS instalado soporta meters de OpenFlow 1.3 antes de proponer cómo limitar la tasa).
+
+
+## R3a - A6: cuarentena por puertos y bloqueo_total
+
+Prompt:
+
+    Fase R3a - A6. Lee CLAUDE.md, docs/PLAN.md (seccion R3a), docs/ajustes.md (A6) y docs/contratos.md (C2, incluidas las dos notas).
+
+    Alcance, solo en ryu_controller.py:
+    - POST /ryu/hosts/{ip}/cuarentena: reemplaza el DROP total por DROP de prioridad 110 en TCP 22, 135, 139, 445, 3389 y 5985 desde esa ip, mas DROP de prioridad 100 de todo lo demas, excepto ARP, DNS (UDP y TCP 53) y DHCP.
+    - POST /ryu/hosts/{ip}/bloqueo_total: vuelve al DROP total desde cualquier modo.
+    - Las dos son idempotentes (repetirlas no duplica reglas), 404 si el host no esta bloqueado, 422 si la ip es invalida, y quedan en el log.
+    - Transaccionales segun la nota de C2: se instalan las reglas del modo nuevo ANTES de quitar el DROP total, en todos los switches del host. Si falla en alguno, se borra lo instalado, queda el DROP total y se responde 500 con {"ok": false, "modo": "drop_total"}.
+    - blocked_hosts guarda el modo; GET /ryu/hosts/bloqueados agrega "modo": "drop_total" o "cuarentena".
+    - GET /ryu/estado: "capacidades": ["cuarentena"].
+    - desbloquear funciona desde cualquier modo y borra TODAS las reglas del host (las de 100 y las de 110).
+    - El host sigue en blocked_hosts mientras este en cuarentena (no se vuelve a evaluar).
+
+    No toques la deteccion, los pesos, los cortes 30/60, la alerta ni las rutas de A5.
+
+    Paso 1: valida y propone en maximo 5 lineas, incluido como haras las excepciones de ARP, DNS y DHCP y como pruebas la reversion transaccional sin sudo. Espera mi aprobacion.
+    Paso 2: implementa y corre la parte 1 de la prueba de aceptacion. No hagas git add ni commit.
+    Paso 3: responde con el formato de entrega.
+
+Prueba de aceptacion, parte 1 (solo Ryu, sin Mininet):
+
+    curl -s localhost:8080/ryu/estado -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: "capacidades": ["cuarentena"].
+
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/ryu/hosts/10.0.10.99/cuarentena -H "X-Agent-Token: $AGENT_TOKEN"
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/ryu/hosts/abc/cuarentena -H "X-Agent-Token: $AGENT_TOKEN"
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/ryu/hosts/10.0.10.99/bloqueo_total -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: 404, 422 y 404.
+
+Prueba de aceptacion, parte 2 (preparacion comun, con h1 bloqueado):
+
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/cuarentena -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: {"ok": true, "ip": "10.0.10.1", "modo": "cuarentena"}.
+
+    curl -s localhost:8080/ryu/hosts/bloqueados -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: 10.0.10.1 con "modo": "cuarentena".
+
+En mininet>:
+    sh ovs-ofctl -O OpenFlow13 dump-flows s1 | grep -E "priority=(100|110)"
+Esperado: reglas de 110 para los 6 puertos TCP y las reglas de 100 con sus excepciones. Repetir en s2 y s3.
+    h1 ping -c 2 h2
+Esperado: 100% de perdida.
+
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/cuarentena -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: ok de nuevo, y el dump-flows de s1 muestra la misma cantidad de reglas (sin duplicados).
+
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/bloqueo_total -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: "modo": "drop_total"; en s1 ya no hay reglas de 110, solo el DROP de 100.
+
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/cuarentena -H "X-Agent-Token: $AGENT_TOKEN"
+    curl -s -X POST localhost:8080/ryu/hosts/10.0.10.1/desbloquear -H "X-Agent-Token: $AGENT_TOKEN"
+Esperado: desbloqueado desde cuarentena; ni reglas de 100 ni de 110 para 10.0.10.1 en s1, s2 y s3, y h1 ping -c 2 h2 responde.
+
+Parte 3 (con el agente, como en R2): el panel ofrece la cuarentena solo cuando la recomienda; al aprobarla, Ryu queda en "modo": "cuarentena" y el agente lo verifica.
