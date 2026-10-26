@@ -150,6 +150,30 @@ LIMIT_PRIORITY     = 90      # por debajo del DROP 100: solo actúa cuando se qu
 LIMIT_DEFAULT_KBPS = 1000
 LIMIT_MAX_KBPS     = 0xFFFFFFFF   # rate del meter es uint32 en OpenFlow 1.3
 
+# ── Cuarentena VLAN con honeypot (A8) ─────────────────────────────────────────
+VLAN_CUARENTENA = 999
+A8_PRIORITY     = 105     # sobre el DROP 100, que no se quita nunca en este modo
+A8_COOKIE       = 0xA8    # marca las reglas cuyo packet-in se releva al honeypot
+
+
+def _leer_honeypot():
+    """Ubicación del honeypot (R3c1) desde el entorno; None si falta o es inválida."""
+    def entero(valor):
+        valor = valor.strip().lower()
+        return int(valor, 16) if valor.startswith('0x') else int(valor)
+    try:
+        dpid   = entero(os.environ['HONEYPOT_DPID'])
+        puerto = entero(os.environ['HONEYPOT_PUERTO'])
+        mac    = os.environ['HONEYPOT_MAC'].strip().lower()
+    except (KeyError, ValueError):
+        return None
+    if dpid <= 0 or puerto <= 0 or not re.fullmatch(r'([0-9a-f]{2}:){5}[0-9a-f]{2}', mac):
+        return None
+    return {'dpid': dpid, 'puerto': puerto, 'mac': mac}
+
+
+HONEYPOT = _leer_honeypot()   # sin honeypot no hay A8
+
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -235,6 +259,12 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         logger.info('=' * 60)
         if AGENT_ENABLED and not AGENT_TOKEN:
             logger.error('[AGENTE] AGENT_TOKEN vacío: el agente rechazará las alertas (401)')
+        if HONEYPOT:
+            logger.info(f'[A8] Honeypot en DPID={HONEYPOT["dpid"]:#018x} '
+                        f'puerto {HONEYPOT["puerto"]} MAC {HONEYPOT["mac"]}')
+        elif any(os.environ.get(v) for v in ('HONEYPOT_DPID', 'HONEYPOT_PUERTO', 'HONEYPOT_MAC')):
+            logger.error('[A8] Variables HONEYPOT_* incompletas o inválidas: '
+                         'cuarentena_vlan deshabilitada')
 
         kwargs['wsgi'].register(RyuIAApi, {API_INSTANCE: self})
 
@@ -260,6 +290,13 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         # Reglas de monitoreo M5
         self._install_m5_monitor_rules(datapath)
 
+        # A8: el honeypot no alcanza a nadie por IPv4 salvo a hosts en vlan_cuarentena
+        if HONEYPOT and dpid == HONEYPOT['dpid']:
+            match = parser.OFPMatch(in_port=HONEYPOT['puerto'], eth_type=0x0800)
+            self._add_flow(datapath, priority=100, match=match, actions=[])
+            logger.info(f'[A8] DROP IPv4 desde el puerto del honeypot '
+                        f'({HONEYPOT["puerto"]}) en DPID={dpid:#018x}')
+
     # ═══════════════════════════════════════════════════════════════════════════
     # CAPA 1 — PROCESAMIENTO NORMAL (Packet-In)
     # ═══════════════════════════════════════════════════════════════════════════
@@ -271,6 +308,11 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         parser   = datapath.ofproto_parser
         in_port  = msg.match['in_port']
         dpid     = datapath.id
+
+        # A8: lo que sube por las reglas de cuarentena VLAN solo se releva
+        if msg.cookie == A8_COOKIE:
+            self._relevo_honeypot(msg)
+            return
 
         pkt     = packet.Packet(msg.data)
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
@@ -805,7 +847,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
     # UTILIDADES
     # ═══════════════════════════════════════════════════════════════════════════
     def _add_flow(self, datapath, priority, match, actions,
-                  idle_timeout=0, hard_timeout=0, table_id=0):
+                  idle_timeout=0, hard_timeout=0, table_id=0, cookie=0):
         ofproto = datapath.ofproto
         parser  = datapath.ofproto_parser
         inst = (
@@ -821,6 +863,7 @@ class SDNRansomwareDetector(app_manager.RyuApp):
             idle_timeout=idle_timeout,
             hard_timeout=hard_timeout,
             table_id=table_id,
+            cookie=cookie,
         )
         return datapath.send_msg(mod)
 
@@ -875,6 +918,16 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                                    parser.OFPMatch(eth_type=0x0800, ipv4_src=ip))
             if modo == 'limitado':
                 borradas += 1
+            for prio, match, _ in self._reglas_vlan_ida(dp, ip):
+                self._borrar_regla(dp, prio, match)
+                if modo == 'vlan_cuarentena':
+                    borradas += 1
+        hp_dp = self.datapaths.get(HONEYPOT['dpid']) if HONEYPOT else None
+        if hp_dp:
+            for prio, match, _ in self._reglas_vlan_vuelta(hp_dp, ip):
+                self._borrar_regla(hp_dp, prio, match)
+                if modo == 'vlan_cuarentena':
+                    borradas += 1
         # Limpiar TODO el estado del host para que no se vuelva a bloquear de inmediato
         self.host_alert_state.pop(ip, None)
         self.metric_snapshot.pop(ip, None)
@@ -932,6 +985,73 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         meter = parser.OFPMeterMod(dp, command=ofp.OFPMC_DELETE, meter_id=meter_id)
         return dp.send_msg(meter) and ok
 
+    def _reglas_vlan_ida(self, dp, ip):
+        """A8, en los switches del host: TCP a puertos críticos -> controlador (relevo)."""
+        parser, ofp = dp.ofproto_parser, dp.ofproto
+        actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
+        return [(A8_PRIORITY,
+                 parser.OFPMatch(eth_type=0x0800, ipv4_src=ip, ip_proto=6, tcp_dst=port),
+                 actions)
+                for port in QUARANTINE_DROP_PORTS]
+
+    def _reglas_vlan_vuelta(self, dp, ip):
+        """A8, en el switch del honeypot: sus respuestas TCP al host -> controlador."""
+        parser, ofp = dp.ofproto_parser, dp.ofproto
+        actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
+        return [(A8_PRIORITY,
+                 parser.OFPMatch(in_port=HONEYPOT['puerto'], eth_type=0x0800,
+                                 ipv4_dst=ip, ip_proto=6, tcp_src=port),
+                 actions)
+                for port in QUARANTINE_DROP_PORTS]
+
+    def _relevo_honeypot(self, msg):
+        """
+        A8: entrega al honeypot lo que el host en vlan_cuarentena envía a un
+        puerto crítico (con la MAC del honeypot) y le devuelve al host las
+        respuestas del honeypot, por la ubicación aprendida en la ida.
+        Nunca inunda: si no hay a dónde enviarlo, se descarta.
+        """
+        dp      = msg.datapath
+        pkt     = packet.Packet(msg.data)
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        ip_pkt  = pkt.get_protocol(ipv4.ipv4)
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+        if not (HONEYPOT and eth_pkt and ip_pkt and tcp_pkt):
+            return
+        in_port = msg.match['in_port']
+
+        if dp.id == HONEYPOT['dpid'] and in_port == HONEYPOT['puerto']:
+            # Vuelta: honeypot -> host
+            info = self.blocked_hosts.get(ip_pkt.dst)
+            ubicacion = (info.get('ubicacion')
+                         if info and info.get('modo') == 'vlan_cuarentena' else None)
+            if not ubicacion:
+                logger.warning(f'[A8] Respuesta del honeypot a {ip_pkt.dst} descartada: '
+                               f'ubicación del host desconocida')
+                return
+            destino_dpid, puerto, mac = ubicacion
+        else:
+            # Ida: host -> honeypot
+            info = self.blocked_hosts.get(ip_pkt.src)
+            if not info or info.get('modo') != 'vlan_cuarentena':
+                return
+            info['ubicacion'] = (dp.id, in_port, eth_pkt.src)
+            destino_dpid, puerto, mac = HONEYPOT['dpid'], HONEYPOT['puerto'], HONEYPOT['mac']
+            if tcp_pkt.bits & tcp.TCP_SYN and not tcp_pkt.bits & tcp.TCP_ACK:
+                logger.warning(f'[A8] {ip_pkt.src}:{tcp_pkt.src_port} -> '
+                               f'{ip_pkt.dst}:{tcp_pkt.dst_port} relevado al honeypot')
+
+        destino = self.datapaths.get(destino_dpid)
+        if destino is None:
+            logger.warning(f'[A8] Paquete descartado: DPID={destino_dpid:#018x} no conectado')
+            return
+        parser, ofp = destino.ofproto_parser, destino.ofproto
+        destino.send_msg(parser.OFPPacketOut(
+            datapath=destino, buffer_id=ofp.OFP_NO_BUFFER, in_port=ofp.OFPP_CONTROLLER,
+            actions=[parser.OFPActionSetField(eth_dst=mac), parser.OFPActionOutput(puerto)],
+            data=msg.data,
+        ))
+
     def cambiar_modo(self, ip, modo, kbps=None):
         """
         Pasa un host bloqueado a 'cuarentena', 'limitado' o 'drop_total'
@@ -948,13 +1068,20 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         actual = info.get('modo', 'drop_total')
         ok = True
 
-        if modo in ('cuarentena', 'limitado'):
+        if modo in ('cuarentena', 'limitado', 'vlan_cuarentena'):
             if modo == 'limitado' and 'meter_id' not in info:
                 usados = {i.get('meter_id') for i in self.blocked_hosts.values()}
                 info['meter_id'] = next(n for n in range(1, len(usados) + 2)
                                         if n not in usados)
+            hp_dp = None
+            if modo == 'vlan_cuarentena':
+                # Primero la vuelta en el switch del honeypot, luego la ida
+                hp_dp = self.datapaths.get(HONEYPOT['dpid']) if HONEYPOT else None
+                ok = hp_dp is not None and all([
+                    self._add_flow(hp_dp, prio, match, actions, cookie=A8_COOKIE)
+                    for prio, match, actions in self._reglas_vlan_vuelta(hp_dp, ip)])
             alcanzados = []
-            for dp in dps:
+            for dp in (dps if ok else []):
                 if dp is None:
                     ok = False
                     break
@@ -962,6 +1089,9 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                 if modo == 'cuarentena':
                     enviados = all([self._add_flow(dp, prio, match, actions)
                                     for prio, match, actions in self._reglas_cuarentena(dp, ip)])
+                elif modo == 'vlan_cuarentena':
+                    enviados = all([self._add_flow(dp, prio, match, actions, cookie=A8_COOKIE)
+                                    for prio, match, actions in self._reglas_vlan_ida(dp, ip)])
                 else:
                     enviados = self._instalar_limite(dp, ip, info['meter_id'], kbps,
                                                      existe=(actual == 'limitado'))
@@ -979,6 +1109,9 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                     info['kbps'] = kbps
                     logger.warning(f'[API] {ip} -> limitado a {kbps} kbps '
                                    f'en {len(dps)} switch(es)')
+                elif modo == 'vlan_cuarentena':
+                    logger.warning(f'[API] {ip} -> vlan_cuarentena (VLAN {VLAN_CUARENTENA}, '
+                                   f'honeypot) en {len(dps)} switch(es)')
                 else:
                     logger.warning(f'[API] {ip} -> cuarentena en {len(dps)} switch(es)')
                 return True
@@ -986,6 +1119,13 @@ class SDNRansomwareDetector(app_manager.RyuApp):
             if modo == 'cuarentena':
                 for dp in alcanzados:
                     for prio, match, _ in self._reglas_cuarentena(dp, ip):
+                        self._borrar_regla(dp, prio, match)
+            elif modo == 'vlan_cuarentena':
+                if hp_dp:
+                    for prio, match, _ in self._reglas_vlan_vuelta(hp_dp, ip):
+                        self._borrar_regla(hp_dp, prio, match)
+                for dp in alcanzados:
+                    for prio, match, _ in self._reglas_vlan_ida(dp, ip):
                         self._borrar_regla(dp, prio, match)
             else:
                 destinos = [dp for dp in dps if dp] if actual == 'limitado' else alcanzados
@@ -1005,9 +1145,20 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                     ok = self._borrar_regla(dp, prio, match) and ok
                 if actual == 'limitado':
                     ok = self._quitar_limite(dp, ip, info['meter_id']) and ok
+                if actual == 'vlan_cuarentena':
+                    for prio, match, _ in self._reglas_vlan_ida(dp, ip):
+                        ok = self._borrar_regla(dp, prio, match) and ok
+            if actual == 'vlan_cuarentena':
+                hp_dp = self.datapaths.get(HONEYPOT['dpid']) if HONEYPOT else None
+                if hp_dp is None:
+                    ok = False
+                else:
+                    for prio, match, _ in self._reglas_vlan_vuelta(hp_dp, ip):
+                        ok = self._borrar_regla(hp_dp, prio, match) and ok
 
         info['modo'] = 'drop_total'
         info.pop('kbps', None)
+        info.pop('ubicacion', None)
         if ok:
             logger.warning(f'[API] {ip} -> drop_total en {len(dps)} switch(es)')
         else:
@@ -1044,7 +1195,8 @@ class RyuIAApi(ControllerBase):
             'umbrales': self.app.umbrales,
             'version': '2.0',
             'pesos': METRIC_WEIGHTS,
-            'capacidades': ['cuarentena', 'limitar_tasa'],
+            'capacidades': ['cuarentena', 'limitar_tasa']
+                           + (['cuarentena_vlan'] if HONEYPOT else []),
         })
 
     @route('ryu_ia', '/ryu/hosts/bloqueados', methods=['GET'])
@@ -1057,6 +1209,8 @@ class RyuIAApi(ControllerBase):
                     'desde': info['desde'], 'modo': info.get('modo', 'drop_total')}
             if fila['modo'] == 'limitado':
                 fila['kbps'] = info['kbps']
+            if fila['modo'] == 'vlan_cuarentena':
+                fila['vlan'] = VLAN_CUARENTENA
             filas.append(fila)
         return _json(filas)
 
@@ -1083,6 +1237,13 @@ class RyuIAApi(ControllerBase):
     @route('ryu_ia', '/ryu/hosts/{ip}/limitar_tasa', methods=['POST'])
     def limitar_tasa(self, req, ip, **kwargs):
         return self._cambiar_modo(req, ip, 'limitado')
+
+    @route('ryu_ia', '/ryu/hosts/{ip}/cuarentena_vlan', methods=['POST'])
+    def cuarentena_vlan(self, req, ip, **kwargs):
+        if HONEYPOT is None:   # sin las variables HONEYPOT_* no hay A8
+            if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
+            return _json({'error': 'cuarentena_vlan no disponible (sin honeypot)'}, 404)
+        return self._cambiar_modo(req, ip, 'vlan_cuarentena')
 
     def _cambiar_modo(self, req, ip, modo):
         if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
@@ -1115,6 +1276,8 @@ class RyuIAApi(ControllerBase):
             return _json({'ok': False, 'modo': 'drop_total'}, 500)
         if modo == 'limitado':
             return _json({'ok': True, 'ip': ip, 'modo': modo, 'kbps': kbps})
+        if modo == 'vlan_cuarentena':
+            return _json({'ok': True, 'ip': ip, 'modo': modo, 'vlan': VLAN_CUARENTENA})
         return _json({'ok': True, 'ip': ip, 'modo': modo})
 
     @route('ryu_ia', '/ryu/umbrales', methods=['GET'])
