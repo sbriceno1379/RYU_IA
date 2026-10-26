@@ -5,3 +5,4 @@
 - Un switch que se conecte después de un bloqueo no recibe el DROP de los hosts ya bloqueados.
 - `arranque_ryu.py` busca `ryu-manager` en el PATH y no en `.venv/bin/`.
 - Detectar errores asincronos del switch (Barrier + OFPErrorMsg) en las acciones de cuarentena; hoy solo se detecta switch desconectado.
+- El aislamiento entre VLAN depende de Ryu (salidas explicitas y FLOOD ignoran los tags de OVS; el ARP cruza VLAN; la regla es OPS contra no OPS por IP)

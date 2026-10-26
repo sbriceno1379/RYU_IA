@@ -11,8 +11,10 @@ Regla de oro: una fase = una sesión de Claude Code = un commit que apruebo yo. 
 | R1b | A5: API REST en el puerto 8080 según C2 | Sí (parte 2 de la prueba) | pendiente |
 | R2 | Integración real: Ryu, Mininet y el agente (202, panel, correo, desbloqueo desde el panel) | Sí | pendiente |
 | R3a | A6: cuarentena por puertos y bloqueo_total, con el campo modo | Sí | pendiente |
-| R3b | A7: limitar_tasa | Sí | pendiente |
+| R3b | A7: limitar_tasa | Sí | pendiente | ✅
 | R3c | A8: cuarentena_vlan (VLAN 999) con host honeypot | Sí | pendiente |
+| R3c1 | Honeypot: host nuevo en la topologia y script que acepta y registra conexiones | Sí | pendiente |
+| R3c2 | A8: cuarentena_vlan (VLAN 999) que desvia al host hacia el honeypot | Sí | pendiente |
 | R4 | Evaluación final con tráfico real | Sí | pendiente |
 
 ## Cómo se trabaja cada fase (igual que en el agente)
@@ -311,3 +313,70 @@ Esperado: "modo": "drop_total"; h1 ping -c 2 h2 vuelve a dar 100% de perdida.
 Esperado: desbloqueado desde limitado; iperf h1 h2 vuelve a la velocidad normal y no queda nada de 10.0.10.1 en s1, s2 y s3.
 
 Parte 3 (con el agente): en el panel, "Acciones" de 10.0.10.1 ofrece "Limitar tasa"; al aplicarla, la fila muestra "Tasa limitada (1000 kbps)".
+
+## R3c - A8: cuarentena en VLAN 999 con honeypot
+
+Decisiones (25-oct-2026): el host en cuarentena VLAN queda en una red donde solo existe un honeypot. El honeypot solo acepta conexiones en los puertos criticos y registra cada intento (hora, ip de origen, ip y puerto que el atacante intento alcanzar). La evidencia queda en un log; no se envia al agente (trabajo futuro). No cambia C1.
+
+Objetivo que se debe poder demostrar: con h1 en vlan_cuarentena, cuando h1 intenta conectarse a un puerto critico de cualquier victima, la conexion la completa el honeypot (no la victima real), queda registrada con el destino que h1 intento, y ninguna victima real recibe nada de h1.
+
+## R3c1 - Honeypot (sin tocar ryu_controller.py)
+
+Prompt:
+
+    Fase R3c1. Lee CLAUDE.md, docs/PLAN.md (secciones R3c y R3c1) y topology_project.py.
+
+    Alcance:
+    1. honeypot.py nuevo, solo libreria estandar: escucha TCP en 22, 135, 139, 445, 3389 y 5985, acepta cada conexion, la cierra y escribe una linea JSON por intento en un log (ts en UTC ISO-8601, ip_origen, puerto_origen, ip_destino, puerto_destino). Termina limpio con Ctrl+C.
+    2. topology_project.py: un host honeypot nuevo, en la VLAN 999, conectado donde sea mas simple de alcanzar desde los hosts de OPS y de ADM. No cambies nada de los hosts, las VLAN 10 y 20 ni los switches existentes.
+    3. El honeypot debe poder recibir conexiones dirigidas a las ip de las victimas (para que la del atacante se complete). Propon como (por ejemplo, alias de ip en el honeypot) y por que no choca con las victimas reales (la VLAN 999 no comparte ARP con la 10 ni la 20).
+
+    No toques ryu_controller.py, los pesos, la deteccion ni la alerta.
+
+    Paso 1: valida y propone en maximo 5 lineas: donde conectas el honeypot (switch y puerto), como recibe las ip de las victimas y que datos de ubicacion necesitara Ryu en R3c2 (por ejemplo HONEYPOT_DPID y HONEYPOT_PUERTO). Espera mi aprobacion.
+    Paso 2: implementa. Prueba sin sudo: honeypot.py en localhost con puertos altos de prueba y un cliente que se conecte; muestra las lineas del log. No hagas git add ni commit.
+    Paso 3: responde con el formato de entrega.
+
+Prueba de aceptacion (con sudo, Ryu como siempre):
+1. La topologia arranca sin errores y muestra el honeypot en la VLAN 999.
+2. En mininet>, h1 ping -c 2 h2 sigue respondiendo (la topologia de siempre no cambio).
+3. En mininet>, el honeypot no alcanza a h2 ni h2 al honeypot (estan en VLAN distintas).
+4. Con honeypot.py corriendo en el honeypot, desde el mismo honeypot una conexion a su propia ip en el puerto 445 queda registrada en el log.
+
+## R3c2 - A8 en Ryu: cuarentena_vlan
+
+Prompt:
+
+    Fase R3c2 - A8. Lee CLAUDE.md, docs/PLAN.md (secciones R3c y R3c2), docs/contratos.md (C2 y sus tres notas) y lo que quedo de R3c1 (honeypot y su ubicacion).
+
+    Alcance, solo en ryu_controller.py:
+    - POST /ryu/hosts/{ip}/cuarentena_vlan: {"ok": true, "ip", "modo": "vlan_cuarentena", "vlan": 999}. 404 si el host no esta bloqueado, 422 ip invalida, 409 si no esta en DROP total (nota de origen).
+    - Efecto: el trafico TCP de ese host hacia los puertos criticos de cualquier destino se entrega al honeypot (y la respuesta del honeypot vuelve al host); todo lo demas del host sigue en DROP. Ninguna victima real recibe nada del host.
+    - Ryu impide que el honeypot alcance a cualquier host que no este en vlan_cuarentena (solo vuelven al host en cuarentena las respuestas del honeypot).
+    - Transaccional segun la nota de C2: las reglas nuevas se instalan antes de quitar nada; si falla en algun switch, se borra lo instalado, queda el DROP total y se responde 500.
+    - La ubicacion del honeypot se lee de variables de entorno (las que acordamos en R3c1). Si no estan definidas, no hay A8: la ruta responde 404 y "cuarentena_vlan" no aparece en capacidades.
+    - GET /ryu/hosts/bloqueados agrega "vlan": 999 en ese modo; capacidades ["cuarentena", "limitar_tasa", "cuarentena_vlan"] cuando hay honeypot.
+    - bloqueo_total vuelve a DROP total desde este modo; desbloquear borra siempre todo lo del host, incluidas las reglas de este modo.
+
+    No toques la deteccion, los pesos, los cortes 30/60, la alerta, A5, A6 ni A7.
+
+    Paso 1: valida y propone en maximo 5 lineas: que reglas instalas en que switches (ida y vuelta), como lo pruebas sin sudo y como queda la reversion. Espera mi aprobacion.
+    Paso 2: implementa y corre la parte 1 de la prueba de aceptacion mas tu prueba de reversion, y la regresion de R3a y R3b. No hagas git add ni commit.
+    Paso 3: responde con el formato de entrega.
+
+Prueba de aceptacion, parte 1 (solo Ryu):
+- Sin las variables del honeypot: "cuarentena_vlan" no esta en capacidades y la ruta da 404.
+- Con las variables: esta en capacidades; 10.0.10.99 da 404 y abc da 422.
+
+Prueba de aceptacion, parte 2 (preparacion comun, honeypot.py corriendo en el honeypot, h1 bloqueado):
+1. POST cuarentena_vlan de 10.0.10.1: "modo": "vlan_cuarentena", "vlan": 999.
+2. En una victima, por ejemplo h2, dejar un servidor de prueba en 445 que anote lo que recibe.
+3. En mininet>: h1 timeout 5 bash -c "echo > /dev/tcp/10.0.10.2/445" && echo conectado
+   Esperado: "conectado"; el log del honeypot tiene una linea con ip_origen 10.0.10.1 e ip_destino 10.0.10.2, puerto 445; el servidor de h2 no recibio nada.
+4. En mininet>: h1 ping -c 2 h2. Esperado: 100% de perdida (lo que no es puerto critico sigue en DROP).
+5. POST cuarentena_vlan otra vez: ok, sin reglas duplicadas.
+6. POST cuarentena de 10.0.10.1: 409 con "modo": "vlan_cuarentena".
+7. POST bloqueo_total: "modo": "drop_total", y la conexion del paso 3 ya no se completa.
+8. POST cuarentena_vlan y luego desbloquear: no queda nada de 10.0.10.1 en s1, s2 y s3, y h1 ping -c 2 h2 responde.
+
+Parte 3 (con el agente): en "Acciones" de 10.0.10.1 aparece "Cuarentena en VLAN"; al aplicarla, la fila muestra "VLAN de cuarentena (VLAN 999)".

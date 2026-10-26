@@ -58,6 +58,9 @@ from mininet.node import RemoteController, OVSSwitch
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 from mininet.link import TCLink
+import os
+import re
+import tempfile
 import time
 import subprocess
 
@@ -75,6 +78,36 @@ SUBNET_ADM = '10.0.20'   # .1 … .10
 LINK_BW     = 100   # Mbps
 LINK_DELAY  = '1ms'
 LINK_LOSS   = 0
+
+# ── Honeypot (VLAN 999) — ubicación que usará Ryu en R3c2 ────────────────────
+VLAN_HONEYPOT    = 999
+HONEYPOT_IP      = '10.0.99.1'
+HONEYPOT_MAC     = '00:00:00:00:09:99'
+HONEYPOT_S3_PORT = 3      # s3-eth3 → HONEYPOT_DPID=3, HONEYPOT_PUERTO=3
+HONEYPOT_PORTS   = (22, 135, 139, 445, 3389, 5985)
+REPO_DIR         = os.path.dirname(os.path.abspath(__file__))
+
+# Filtro propio del honeypot: redirige a sí mismo los puertos críticos dirigidos
+# a cualquier IP, solo acepta esos puertos y no inicia ninguna conexión.
+NFT_HONEYPOT = '''
+table ip honeypot {{
+    chain pre {{
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "honeypot-eth0" tcp dport {{ {puertos} }} redirect
+    }}
+    chain entrada {{
+        type filter hook input priority filter; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        iifname "honeypot-eth0" tcp dport {{ {puertos} }} accept
+    }}
+    chain salida {{
+        type filter hook output priority filter; policy drop;
+        oifname "lo" accept
+        ct state established,related accept
+    }}
+}}
+'''
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def set_vlan_port(switch, port, vlan_id, mode='access'):
@@ -211,6 +244,11 @@ def build_topology():
     net.addLink(s1, s3, **link_params)   # s1-eth11 ↔ s3-eth1
     net.addLink(s2, s3, **link_params)   # s2-eth11 ↔ s3-eth2
 
+    # ── Honeypot en VLAN 999, colgado del core ───────────────────────────────
+    info('*** Agregando honeypot (VLAN 999) en s3\n')
+    honeypot = net.addHost('honeypot', ip=f'{HONEYPOT_IP}/24', mac=HONEYPOT_MAC)
+    net.addLink(honeypot, s3, **link_params)   # honeypot-eth0 ↔ s3-eth3
+
     return net, c0, s1, s2, s3, ops_hosts, adm_hosts
 
 
@@ -247,6 +285,49 @@ def configure_vlans(s1, s2, s3, n_ops=10, n_adm=10):
     set_vlan_port(s3, 2, None, mode='trunk')
 
 
+def setup_honeypot(net, s3):
+    """
+    Deja el honeypot en VLAN 999 con su filtro nft y arranca honeypot.py.
+    Si nft falla, el honeypot queda apagado: nunca un honeypot sin su filtro.
+    """
+    hp = net.get('honeypot')
+    info(f'\n*** Configurando honeypot ({HONEYPOT_IP}, VLAN {VLAN_HONEYPOT})\n')
+    set_vlan_port(s3, HONEYPOT_S3_PORT, VLAN_HONEYPOT, mode='access')
+    # Ruta on-link para responder a los hosts de OPS y ADM
+    hp.cmd('ip route add 10.0.0.0/16 dev honeypot-eth0')
+
+    reglas = NFT_HONEYPOT.format(puertos=', '.join(map(str, HONEYPOT_PORTS)))
+    with tempfile.NamedTemporaryFile('w', suffix='.nft', delete=False) as f:
+        f.write(reglas)
+    salida = hp.cmd(f'nft -f {f.name} 2>&1; echo "rc=$?"')
+    os.unlink(f.name)
+    rc = re.search(r'rc=(\d+)\s*$', salida)
+    if not rc or rc.group(1) != '0':
+        hp.cmd('ip link set honeypot-eth0 down')
+        info('\n' + '!' * 70 + '\n')
+        info('  [ERROR] nft no pudo aplicar el filtro del honeypot:\n')
+        info(f'  {salida.strip()}\n')
+        info('  El honeypot queda APAGADO (honeypot-eth0 down) y honeypot.py NO se arranca.\n')
+        info('!' * 70 + '\n')
+        return False
+
+    # logs/ del repo, con dueño el usuario que corrió sudo
+    logs = os.path.join(REPO_DIR, 'logs')
+    log = os.path.join(logs, 'honeypot.jsonl')
+    out = os.path.join(logs, 'honeypot.out')
+    os.makedirs(logs, exist_ok=True)
+    open(log, 'a').close()
+    open(out, 'a').close()
+    if os.environ.get('SUDO_UID'):
+        for p in (logs, log, out):
+            os.chown(p, int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID']))
+    hp.cmd(f'python3 {REPO_DIR}/honeypot.py --log {log} '
+           f'> {out} 2>&1 &')
+    info(f'    [OK] filtro nft aplicado; honeypot.py escuchando en {HONEYPOT_PORTS}\n')
+    info(f'    [OK] log: {log}\n')
+    return True
+
+
 def verify_connectivity(net, ops_hosts, adm_hosts):
     """
     Prueba de conectividad intra-VLAN y verifica aislamiento inter-VLAN.
@@ -278,6 +359,8 @@ def print_summary(ops_hosts, adm_hosts):
         info(f'  h{i:<7} {SUBNET_OPS}.{i:<12} VLAN {VLAN_OPS}    s1          {role}\n')
     for i in range(1, 11):
         info(f'  h{i+10:<7} {SUBNET_ADM}.{i:<12} VLAN {VLAN_ADM}    s2          Workstation ADM\n')
+    info(f'  {"honeypot":<8} {HONEYPOT_IP:<18} VLAN {VLAN_HONEYPOT}   s3-eth{HONEYPOT_S3_PORT}     '
+         f'Honeypot (cuarentena VLAN)\n')
     info('-'*70 + '\n')
     info(f'  s1   → Switch OPS  (DPID: 0x0000000000000001)\n')
     info(f'  s2   → Switch ADM  (DPID: 0x0000000000000002)\n')
@@ -328,6 +411,7 @@ def run():
 
     # 4. Configurar VLANs en OVS
     configure_vlans(s1, s2, s3, n_ops=10, n_adm=10)
+    setup_honeypot(net, s3)
 
     # 5. Esperar conexión de switches con el controlador Ryu
     info('\n*** Esperando conexión con el controlador Ryu (5 s)...\n')
