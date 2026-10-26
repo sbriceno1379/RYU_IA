@@ -71,6 +71,8 @@ Nota C2 (transaccional): cuarentena, limitar_tasa, cuarentena_vlan y bloqueo_tot
 
 Nota C2 (Ryu sin A5): si /ryu/hosts/bloqueados o /ryu/umbrales responden 404 (ruta inexistente), el agente responde 503 "Ryu no expone la API REST (A5)" en /api/ryu/bloqueados, /api/ryu/umbrales y en el desbloqueo, y GET /api/ryu/estado informa "api_no_disponible (falta A5)".
 
+Nota C2 (origen): cuarentena, limitar_tasa y cuarentena_vlan solo se aplican desde DROP total. Si el host está en otro modo, Ryu responde 409 {"ok": false, "modo": "<modo actual>"} y no cambia nada. Para pasar de un modo a otro, primero bloqueo_total.
+
 ## C3. Agente → Apps Script: `POST <APPSCRIPT_URL>`
 
 ```json

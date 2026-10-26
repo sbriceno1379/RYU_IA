@@ -145,6 +145,11 @@ RATE_LIMIT_HARD_TIMEOUT = 120
 QUARANTINE_DROP_PORTS = (22, 135, 139, 445, 3389, 5985)  # TCP, DROP prioridad 110
 QUARANTINE_ALLOW      = ((17, 53), (6, 53), (17, 67))    # DNS UDP/TCP y DHCP, prioridad 101
 
+# ── Limitar tasa (A7) ─────────────────────────────────────────────────────────
+LIMIT_PRIORITY     = 90      # por debajo del DROP 100: solo actúa cuando se quita
+LIMIT_DEFAULT_KBPS = 1000
+LIMIT_MAX_KBPS     = 0xFFFFFFFF   # rate del meter es uint32 en OpenFlow 1.3
+
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -854,11 +859,22 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                 match=parser.OFPMatch(eth_type=0x0800, ipv4_src=ip),
             )
             dp.send_msg(mod)
-            borradas += 1
-            if info.get('modo') == 'cuarentena':
-                for prio, match, _ in self._reglas_cuarentena(dp, ip):
-                    self._borrar_regla(dp, prio, match)
+            # Se borra SIEMPRE todo lo que pudo quedar del host (aunque una
+            # transacción haya fallado a medias); el conteo sigue el modo actual
+            modo = info.get('modo')
+            if modo != 'limitado':   # en limitado el DROP 100 ya no existe
+                borradas += 1
+            for prio, match, _ in self._reglas_cuarentena(dp, ip):
+                self._borrar_regla(dp, prio, match)
+                if modo == 'cuarentena':
                     borradas += 1
+            if 'meter_id' in info:
+                self._quitar_limite(dp, ip, info['meter_id'])
+            else:
+                self._borrar_regla(dp, LIMIT_PRIORITY,
+                                   parser.OFPMatch(eth_type=0x0800, ipv4_src=ip))
+            if modo == 'limitado':
+                borradas += 1
         # Limpiar TODO el estado del host para que no se vuelva a bloquear de inmediato
         self.host_alert_state.pop(ip, None)
         self.metric_snapshot.pop(ip, None)
@@ -892,39 +908,92 @@ class SDNRansomwareDetector(app_manager.RyuApp):
         )
         return dp.send_msg(mod)
 
-    def cambiar_modo(self, ip, modo):
+    def _instalar_limite(self, dp, ip, meter_id, kbps, existe):
+        """Meter OF1.3 (banda DROP a kbps) + regla LIMIT_PRIORITY que reenvía con NORMAL."""
+        parser, ofp = dp.ofproto_parser, dp.ofproto
+        meter = parser.OFPMeterMod(
+            dp, command=ofp.OFPMC_MODIFY if existe else ofp.OFPMC_ADD,
+            flags=ofp.OFPMF_KBPS, meter_id=meter_id,
+            bands=[parser.OFPMeterBandDrop(rate=kbps, burst_size=0)],
+        )
+        inst = [parser.OFPInstructionMeter(meter_id),
+                parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
+                                             [parser.OFPActionOutput(ofp.OFPP_NORMAL)])]
+        mod = parser.OFPFlowMod(
+            datapath=dp, priority=LIMIT_PRIORITY, instructions=inst,
+            match=parser.OFPMatch(eth_type=0x0800, ipv4_src=ip),
+        )
+        return dp.send_msg(meter) and dp.send_msg(mod)
+
+    def _quitar_limite(self, dp, ip, meter_id):
+        parser, ofp = dp.ofproto_parser, dp.ofproto
+        ok = self._borrar_regla(dp, LIMIT_PRIORITY,
+                                parser.OFPMatch(eth_type=0x0800, ipv4_src=ip))
+        meter = parser.OFPMeterMod(dp, command=ofp.OFPMC_DELETE, meter_id=meter_id)
+        return dp.send_msg(meter) and ok
+
+    def cambiar_modo(self, ip, modo, kbps=None):
         """
-        Pasa un host bloqueado a 'cuarentena' o a 'drop_total' (A6, nota C2).
-        El modo nuevo se instala antes de quitar el anterior y el DROP de
-        prioridad 100 no se quita nunca. Devuelve None si el host no está
-        bloqueado, True si quedó en el modo pedido y False si falló en algún
-        switch (en ese caso queda en drop_total).
+        Pasa un host bloqueado a 'cuarentena', 'limitado' o 'drop_total'
+        (A6/A7, notas C2). El modo nuevo se instala antes de quitar el DROP
+        total; en cuarentena el DROP de 100 no se quita nunca, en limitado se
+        quita al final. El modo de origen lo valida la API (409). Devuelve None
+        si el host no está bloqueado, True si quedó en el modo pedido y False
+        si falló en algún switch (en ese caso queda en drop_total).
         """
         info = self.blocked_hosts.get(ip)
         if info is None:
             return None
         dps = [self.datapaths.get(dpid) for dpid in info['dpids']]
+        actual = info.get('modo', 'drop_total')
         ok = True
 
-        if modo == 'cuarentena':
+        if modo in ('cuarentena', 'limitado'):
+            if modo == 'limitado' and 'meter_id' not in info:
+                usados = {i.get('meter_id') for i in self.blocked_hosts.values()}
+                info['meter_id'] = next(n for n in range(1, len(usados) + 2)
+                                        if n not in usados)
             alcanzados = []
             for dp in dps:
                 if dp is None:
                     ok = False
                     break
                 alcanzados.append(dp)
-                if not all([self._add_flow(dp, prio, match, actions)
-                            for prio, match, actions in self._reglas_cuarentena(dp, ip)]):
+                if modo == 'cuarentena':
+                    enviados = all([self._add_flow(dp, prio, match, actions)
+                                    for prio, match, actions in self._reglas_cuarentena(dp, ip)])
+                else:
+                    enviados = self._instalar_limite(dp, ip, info['meter_id'], kbps,
+                                                     existe=(actual == 'limitado'))
+                if not enviados:
                     ok = False
                     break
+            if ok and modo == 'limitado':
+                # Recién ahora se quita el DROP total: el host sale por la regla con meter
+                for dp in dps:
+                    match = dp.ofproto_parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
+                    ok = self._borrar_regla(dp, 100, match) and ok
             if ok:
-                info['modo'] = 'cuarentena'
-                logger.warning(f'[API] {ip} -> cuarentena en {len(dps)} switch(es)')
+                info['modo'] = modo
+                if modo == 'limitado':
+                    info['kbps'] = kbps
+                    logger.warning(f'[API] {ip} -> limitado a {kbps} kbps '
+                                   f'en {len(dps)} switch(es)')
+                else:
+                    logger.warning(f'[API] {ip} -> cuarentena en {len(dps)} switch(es)')
                 return True
-            # Reversión: borrar lo instalado; el DROP de 100 sigue puesto
-            for dp in alcanzados:
-                for prio, match, _ in self._reglas_cuarentena(dp, ip):
-                    self._borrar_regla(dp, prio, match)
+            # Reversión: DROP total de vuelta y borrar lo instalado
+            if modo == 'cuarentena':
+                for dp in alcanzados:
+                    for prio, match, _ in self._reglas_cuarentena(dp, ip):
+                        self._borrar_regla(dp, prio, match)
+            else:
+                destinos = [dp for dp in dps if dp] if actual == 'limitado' else alcanzados
+                for dp in [dp for dp in dps if dp]:
+                    match = dp.ofproto_parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
+                    self._add_flow(dp, 100, match, [])
+                for dp in destinos:
+                    self._quitar_limite(dp, ip, info['meter_id'])
         else:
             for dp in dps:
                 if dp is None:
@@ -934,8 +1003,11 @@ class SDNRansomwareDetector(app_manager.RyuApp):
                 ok = self._add_flow(dp, 100, match, []) and ok
                 for prio, match, _ in self._reglas_cuarentena(dp, ip):
                     ok = self._borrar_regla(dp, prio, match) and ok
+                if actual == 'limitado':
+                    ok = self._quitar_limite(dp, ip, info['meter_id']) and ok
 
         info['modo'] = 'drop_total'
+        info.pop('kbps', None)
         if ok:
             logger.warning(f'[API] {ip} -> drop_total en {len(dps)} switch(es)')
         else:
@@ -972,17 +1044,21 @@ class RyuIAApi(ControllerBase):
             'umbrales': self.app.umbrales,
             'version': '2.0',
             'pesos': METRIC_WEIGHTS,
-            'capacidades': ['cuarentena'],
+            'capacidades': ['cuarentena', 'limitar_tasa'],
         })
 
     @route('ryu_ia', '/ryu/hosts/bloqueados', methods=['GET'])
     def bloqueados(self, req, **kwargs):
         if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
-        return _json([
-            {'ip': ip, 'dpid': f'{info["dpids"][0]:#018x}' if info['dpids'] else None,
-             'desde': info['desde'], 'modo': info.get('modo', 'drop_total')}
-            for ip, info in self.app.blocked_hosts.items()
-        ])
+        filas = []
+        for ip, info in self.app.blocked_hosts.items():
+            fila = {'ip': ip,
+                    'dpid': f'{info["dpids"][0]:#018x}' if info['dpids'] else None,
+                    'desde': info['desde'], 'modo': info.get('modo', 'drop_total')}
+            if fila['modo'] == 'limitado':
+                fila['kbps'] = info['kbps']
+            filas.append(fila)
+        return _json(filas)
 
     @route('ryu_ia', '/ryu/hosts/{ip}/desbloquear', methods=['POST'])
     def desbloquear(self, req, ip, **kwargs):
@@ -1004,17 +1080,41 @@ class RyuIAApi(ControllerBase):
     def bloqueo_total(self, req, ip, **kwargs):
         return self._cambiar_modo(req, ip, 'drop_total')
 
+    @route('ryu_ia', '/ryu/hosts/{ip}/limitar_tasa', methods=['POST'])
+    def limitar_tasa(self, req, ip, **kwargs):
+        return self._cambiar_modo(req, ip, 'limitado')
+
     def _cambiar_modo(self, req, ip, modo):
         if not self._autorizado(req): return _json({'error': 'no autorizado'}, 401)
         try:
             ipaddress.IPv4Address(ip)
         except ValueError:
             return _json({'error': 'ip inválida'}, 422)
-        ok = self.app.cambiar_modo(ip, modo)
-        if ok is None:
+        kbps = None
+        if modo == 'limitado':
+            try:
+                cuerpo = json.loads(req.body or b'{}')
+            except ValueError:
+                return _json({'error': 'json inválido'}, 422)
+            if not isinstance(cuerpo, dict):
+                return _json({'error': 'el cuerpo debe ser un objeto JSON'}, 422)
+            kbps = cuerpo.get('kbps', LIMIT_DEFAULT_KBPS)
+            # bool es subclase de int en Python: se rechaza aparte
+            if (isinstance(kbps, bool) or not isinstance(kbps, int)
+                    or not 0 < kbps <= LIMIT_MAX_KBPS):
+                return _json({'error': 'kbps inválido'}, 422)
+        info = self.app.blocked_hosts.get(ip)
+        if info is None:
             return _json({'error': 'host no bloqueado'}, 404)
+        # Nota C2 (origen): solo desde DROP total (o repitiendo el mismo modo)
+        actual = info.get('modo', 'drop_total')
+        if modo != 'drop_total' and actual not in ('drop_total', modo):
+            return _json({'ok': False, 'modo': actual}, 409)
+        ok = self.app.cambiar_modo(ip, modo, kbps=kbps)
         if not ok:
             return _json({'ok': False, 'modo': 'drop_total'}, 500)
+        if modo == 'limitado':
+            return _json({'ok': True, 'ip': ip, 'modo': modo, 'kbps': kbps})
         return _json({'ok': True, 'ip': ip, 'modo': modo})
 
     @route('ryu_ia', '/ryu/umbrales', methods=['GET'])
