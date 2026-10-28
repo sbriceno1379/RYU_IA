@@ -125,10 +125,18 @@ def esperar(condicion, timeout, paso=0.5):
 
 def arrancar_ryu(ryu_cmd, log_path, env):
     usuario = os.environ.get('SUDO_USER')   # Ryu corre sin root, como en PLAN.md
-    salida = open(log_path, 'w')
+    salida = open(log_path, 'a')   # en modo 'a': si Ryu se reinicia, el log conserva por qué se cayó
     extra = {'user': usuario} if usuario and os.geteuid() == 0 else {}
     return subprocess.Popen(shlex.split(ryu_cmd), cwd=REPO, stdout=salida, stderr=subprocess.STDOUT,
                             env=env, **extra), salida
+
+
+def cola_log(ruta, lineas=15):
+    try:
+        with open(ruta, encoding='utf-8', errors='replace') as f:
+            return ''.join(f.readlines()[-lineas:]).strip()
+    except OSError:
+        return '(sin log)'
 
 
 def detener(proc, espera=5):
@@ -171,22 +179,56 @@ def ejecutar_corrida(corrida, escenario, args, dir_corrida, env):
                 'logs': {'ryu': os.path.join(dir_corrida, 'ryu.log'), 'victimas': {}, 'procesos': {}},
                 'error': None}
 
+    # mn -c mata cualquier ryu-manager (está en su lista de procesos a limpiar): siempre ANTES de arrancar Ryu
     subprocess.call(['mn', '-c'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    ryu, ryu_salida = arrancar_ryu(args.ryu_cmd, registro['logs']['ryu'], env)
-    t_ryu = time.time()
+    ryu_log = registro['logs']['ryu']
+    estado_ryu = {'proc': None, 'salida': None, 't': 0.0}
+    registro['ryu_reinicios'] = 0
+
+    def levantar_ryu():
+        if estado_ryu['salida'] is not None:
+            estado_ryu['salida'].close()
+        estado_ryu['proc'], estado_ryu['salida'] = arrancar_ryu(args.ryu_cmd, ryu_log, env)
+        estado_ryu['t'] = time.time()   # la gracia de Ryu cuenta desde su último arranque
+        if not esperar(lambda: ryu_get('/ryu/estado', token) is not None, 30):
+            raise RuntimeError('La API de Ryu no respondió en 30 s. Últimas líneas de ryu.log:\n' + cola_log(ryu_log))
+
+    def ryu_vivo(momento):
+        """Si Ryu se cayó, lo reinicia (lo que se hacía a mano al levantar la topología)."""
+        proc = estado_ryu['proc']
+        if proc.poll() is None:
+            return
+        if registro['ryu_reinicios'] >= 2:
+            raise RuntimeError(f'Ryu se cayó {momento} por tercera vez. Últimas líneas de ryu.log:\n' + cola_log(ryu_log))
+        registro['ryu_reinicios'] += 1
+        log(f'  Ryu se cayó {momento} (código {proc.returncode}); se reinicia')
+        with open(ryu_log, 'a') as f:
+            f.write(f'\n===== [orquestador] Ryu terminó {momento} con código {proc.returncode}; se reinicia =====\n')
+        levantar_ryu()
+
     registro['t_ryu_inicio'] = ahora_iso()
     net, procesos, victimas = None, [], []
     try:
-        if not esperar(lambda: ryu_get('/ryu/estado', token) is not None, 30):
-            raise RuntimeError('La API de Ryu no respondió en 30 s (¿AGENT_TOKEN?, ¿.venv?)')
+        levantar_ryu()
         net, _c0, s1, s2, s3, ops, adm = topo.build_topology()
         net.start()
         time.sleep(3)
         topo.configure_vlans(s1, s2, s3, n_ops=10, n_adm=10)
         if args.honeypot:
             topo.setup_honeypot(net, s3)
-        if not esperar(lambda: len(ryu_get('/ryu/estado', token)['switches']) >= 3, 30):
-            raise RuntimeError('Los 3 switches no se conectaron a Ryu en 30 s')
+        limite = time.time() + 60
+        while True:   # los switches OVS se reconectan solos si Ryu se reinicia
+            ryu_vivo('al levantar la topología')
+            try:
+                if len(ryu_get('/ryu/estado', token)['switches']) >= 3:
+                    break
+            except Exception:
+                pass
+            if time.time() > limite:
+                raise RuntimeError('Los 3 switches no se conectaron a Ryu en 60 s. Últimas líneas de ryu.log:\n'
+                                   + cola_log(ryu_log))
+            time.sleep(0.5)
+        t_ryu = estado_ryu['t']
 
         # Calentamiento dentro de la gracia: Ryu aprende las estaciones (workstation_ips)
         for grupo in (ops, adm):
@@ -222,6 +264,8 @@ def ejecutar_corrida(corrida, escenario, args, dir_corrida, env):
 
         bloqueados, t_primer_bloqueo = {}, None
         while True:
+            if estado_ryu['proc'].poll() is not None:   # a mitad del escenario no se reinicia: la corrida no vale
+                raise RuntimeError('Ryu se cayó durante el escenario. Últimas líneas de ryu.log:\n' + cola_log(ryu_log))
             transcurrido = time.time() - t0
             try:
                 for fila in ryu_get('/ryu/hosts/bloqueados', token):
@@ -259,8 +303,9 @@ def ejecutar_corrida(corrida, escenario, args, dir_corrida, env):
             detener(p, 2)
         if net is not None:
             net.stop()
-        detener(ryu)
-        ryu_salida.close()
+        detener(estado_ryu['proc'])
+        if estado_ryu['salida'] is not None:
+            estado_ryu['salida'].close()
         subprocess.call(['mn', '-c'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return registro
 
