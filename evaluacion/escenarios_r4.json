@@ -1,0 +1,243 @@
+{
+  "version": 1,
+  "descripcion": "Escenarios de la evaluación R4 (objetivo 3). Cada corrida ejecuta UN escenario con Ryu recién arrancado. La etiqueta es la verdad de terreno: ataque o benigno.",
+  "notas": [
+    "Placeholders: {python} intérprete de los hosts, {trafico} ruta a evaluacion/trafico.py, {repo} raíz del repo, {log} bitácora JSONL del proceso, {semilla} semilla de la corrida.",
+    "sospechosos: IPs que la detección debería aislar en un escenario de ataque. En los benignos, cualquier bloqueo es un falso positivo.",
+    "metricas_previstas: lo que se espera según la lectura del código de ryu_controller.py; la evaluación mide lo que ocurre de verdad.",
+    "dificil=true: caso que, por diseño de las métricas, se espera que el detector falle (ataque bajo los umbrales o benigno que imita el movimiento lateral). Se reportan aparte además de en el total.",
+    "M3 aparece como 'teorica' en A3 y A6: según el código, M3 solo se evalúa sobre reglas con ipv4_src, ipv4_dst y tcp_dst=445, que hoy son las de monitoreo M5 (permanentes, duración > 5 s). Se espera que M3 no se dispare; las corridas lo confirman o lo refutan.",
+    "M1 y M4 cuentan Packet-In, no conexiones: hacia los pares vigilados por las reglas de monitoreo (hosts .1 a .5 de cada VLAN, puertos críticos) cada paquete sube al controlador. M1 dispara con más de 40 paquetes/min a puertos críticos y M4 con más de 200 Packet-In/min; el volumen enviado decide si dispara M4."
+  ],
+  "escenarios": [
+    {
+      "id": "A1",
+      "nombre": "Barrido y ráfaga de conexiones (ataque_completo.py)",
+      "etiqueta": "ataque",
+      "dificil": false,
+      "referencia": "MITRE ATT&CK T1046 (Network Service Discovery) + T1021.002 (SMB/Windows Admin Shares)",
+      "sospechosos": [
+        "10.0.10.1"
+      ],
+      "metricas_previstas": [
+        "M1",
+        "M2",
+        "M5"
+      ],
+      "duracion_max_s": 180,
+      "procesos": [
+        {
+          "host": "h1",
+          "cmd": "{python} {repo}/ataque_completo.py"
+        }
+      ]
+    },
+    {
+      "id": "A2",
+      "nombre": "Movimiento lateral dirigido y pausado a pocos equipos (2 métricas)",
+      "etiqueta": "ataque",
+      "dificil": false,
+      "referencia": "T1021.002: conexiones sin carga a 5 pares (equipo, puerto) cada 2,5 s, ~100 Packet-In/min: sobre M1 (40/min) y bajo M4 (200/min)",
+      "sospechosos": [
+        "10.0.10.1"
+      ],
+      "metricas_previstas": [
+        "M1",
+        "M5"
+      ],
+      "duracion_max_s": 150,
+      "procesos": [
+        {
+          "host": "h1",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.2-4 --puertos 445,135 --max-pares 5 --intervalo 2.5 --ciclos 0 --duracion 120 --log {log}"
+        }
+      ]
+    },
+    {
+      "id": "A3",
+      "nombre": "Propagación por SMB con transferencia de carga (tipo WannaCry/PsExec)",
+      "etiqueta": "ataque",
+      "dificil": false,
+      "referencia": "T1021.002 + T1570: 600 KB por SMB a 9 equipos de la VLAN",
+      "sospechosos": [
+        "10.0.10.1"
+      ],
+      "metricas_previstas": [
+        "M1",
+        "M2",
+        "M4",
+        "M5"
+      ],
+      "metricas_teoricas": [
+        "M3"
+      ],
+      "duracion_max_s": 180,
+      "procesos": [
+        {
+          "host": "h1",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.2-10 --puertos 445 --bytes 614400 --intervalo 0.3 --ciclos 0 --duracion 150 --log {log}"
+        }
+      ]
+    },
+    {
+      "id": "A4",
+      "nombre": "Movimiento lateral lento (low-and-slow), bajo los umbrales de ventana",
+      "etiqueta": "ataque",
+      "dificil": true,
+      "referencia": "Evasión por baja tasa: una conexión cada 12 s a 4 equipos en 445/3389",
+      "sospechosos": [
+        "10.0.10.1"
+      ],
+      "metricas_previstas": [
+        "M5"
+      ],
+      "duracion_max_s": 260,
+      "procesos": [
+        {
+          "host": "h1",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.2-5 --puertos 445,3389 --intervalo 12 --ciclos 0 --duracion 240 --aleatorio --semilla {semilla} --log {log}"
+        }
+      ]
+    },
+    {
+      "id": "A5",
+      "nombre": "Movimiento lateral por RDP/WinRM en la VLAN ADM",
+      "etiqueta": "ataque",
+      "dificil": false,
+      "referencia": "T1021.001 (RDP) + T1021.006 (WinRM) desde h11 hacia 9 equipos de ADM",
+      "sospechosos": [
+        "10.0.20.1"
+      ],
+      "metricas_previstas": [
+        "M1",
+        "M2",
+        "M4",
+        "M5"
+      ],
+      "duracion_max_s": 150,
+      "procesos": [
+        {
+          "host": "h11",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.20.2-10 --puertos 3389,5985 --bytes 32768 --intervalo 0.2 --ciclos 0 --duracion 120 --log {log}"
+        }
+      ]
+    },
+    {
+      "id": "A6",
+      "nombre": "Ransomware completo: reconocimiento, ráfaga y propagación por SMB con carga",
+      "etiqueta": "ataque",
+      "dificil": false,
+      "referencia": "T1046 + T1021.002 + T1570: barrido rápido de los 5 puertos críticos en 9 equipos en paralelo con copias de 1 MB por SMB (umbral M3: > 512000 B en < 5 s). Busca disparar las 5 métricas",
+      "sospechosos": [
+        "10.0.10.1"
+      ],
+      "metricas_previstas": [
+        "M1",
+        "M2",
+        "M4",
+        "M5"
+      ],
+      "metricas_teoricas": [
+        "M3"
+      ],
+      "duracion_max_s": 180,
+      "procesos": [
+        {
+          "host": "h1",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.2-10 --puertos 445 --bytes 1048576 --intervalo 0.5 --ciclos 0 --duracion 150 --log {log}"
+        },
+        {
+          "host": "h1",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.2-10 --puertos 135,139,445,3389,5985 --intervalo 0.05 --ciclos 0 --duracion 150 --aleatorio --semilla {semilla} --timeout 0.3 --log {log}"
+        }
+      ]
+    },
+    {
+      "id": "B1",
+      "nombre": "Servicio web interno (puerto no crítico) desde tres equipos",
+      "etiqueta": "benigno",
+      "dificil": false,
+      "referencia": "Tráfico de usuario normal: HTTP 8080 a 6 servidores, 20 KB por petición",
+      "sospechosos": [],
+      "metricas_previstas": [],
+      "duracion_max_s": 130,
+      "procesos": [
+        {
+          "host": "h2",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.5-10 --puertos 8080 --bytes 20000 --intervalo 1 --ciclos 0 --duracion 120 --log {log}"
+        },
+        {
+          "host": "h3",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.5-10 --puertos 8080 --bytes 20000 --intervalo 1 --ciclos 0 --duracion 120 --log {log}"
+        },
+        {
+          "host": "h4",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.5-10 --puertos 8080 --bytes 20000 --intervalo 1 --ciclos 0 --duracion 120 --log {log}"
+        }
+      ]
+    },
+    {
+      "id": "B2",
+      "nombre": "Servidor de archivos legítimo (SMB a un único servidor)",
+      "etiqueta": "benigno",
+      "dificil": false,
+      "referencia": "Tres clientes copian 2 MB por SMB al mismo servidor (h5) cada 5 s: M1 y M4 suman 40 (sospechoso, sin bloqueo)",
+      "sospechosos": [],
+      "metricas_previstas": [
+        "M1",
+        "M4"
+      ],
+      "duracion_max_s": 130,
+      "procesos": [
+        {
+          "host": "h2",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.5 --puertos 445 --bytes 2000000 --intervalo 5 --ciclos 0 --duracion 120 --log {log}"
+        },
+        {
+          "host": "h3",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.5 --puertos 445 --bytes 2000000 --intervalo 5 --ciclos 0 --duracion 120 --log {log}"
+        },
+        {
+          "host": "h4",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.5 --puertos 445 --bytes 2000000 --intervalo 5 --ciclos 0 --duracion 120 --log {log}"
+        }
+      ]
+    },
+    {
+      "id": "B3",
+      "nombre": "Administrador de TI revisando 3 servidores por RDP y WinRM",
+      "etiqueta": "benigno",
+      "dificil": true,
+      "referencia": "Par mínimo de A5: mismo patrón con 3 destinos. Por diseño de M5 (>= 5 pares) se espera un falso positivo",
+      "sospechosos": [],
+      "metricas_previstas": [
+        "M1",
+        "M4",
+        "M5"
+      ],
+      "duracion_max_s": 90,
+      "procesos": [
+        {
+          "host": "h11",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.20.2-4 --puertos 3389,5985 --bytes 8192 --intervalo 2 --ciclos 1 --log {log}"
+        }
+      ]
+    },
+    {
+      "id": "B4",
+      "nombre": "Transferencia masiva entre dos equipos (puerto no crítico)",
+      "etiqueta": "benigno",
+      "dificil": false,
+      "referencia": "Copia de respaldo: 3 × 50 MB por TCP 5001",
+      "sospechosos": [],
+      "metricas_previstas": [],
+      "duracion_max_s": 130,
+      "procesos": [
+        {
+          "host": "h6",
+          "cmd": "{python} {trafico} conexiones --destinos 10.0.10.7 --puertos 5001 --bytes 50000000 --intervalo 2 --ciclos 3 --timeout 30 --log {log}"
+        }
+      ]
+    }
+  ]
+}
